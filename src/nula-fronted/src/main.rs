@@ -1,37 +1,28 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::Parser as ClapParser;
 use indextree::{Arena, NodeId};
-use log::{debug, error, info};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::PathBuf;
+use std::marker::PhantomData;
 use thiserror::Error;
-use logos::Logos;
+use logos::{Logos, Lexer};
 use winnow::prelude::*;
-use winnow::token::*;
+use winnow::token::{one_of, take_while};
 use winnow::combinator::*;
+use winnow::Parser;
+use winnow::error::{ContextError, ErrMode};
 
-// Custom error types with miette integration
 #[derive(Error, Diagnostic, Debug)]
 enum FrontendError {
     #[error("IO error: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
-
-    #[error("Lexing failed: {message}")]
-    #[diagnostic(code(nula::lex_error))]
-    Lex {
-        message: String,
-        #[source_code]
-        src: NamedSource<String>,
-        #[label("here")]
-        span: SourceSpan,
-    },
 
     #[error("Parsing failed: {message}")]
     #[diagnostic(code(nula::parse_error))]
@@ -44,254 +35,430 @@ enum FrontendError {
     },
 }
 
-// Lexer tokens using Logos
 #[derive(Logos, Debug, PartialEq, Clone)]
 enum Token {
     #[token("write")]
     Write,
-
     #[token("require")]
     Require,
-
-    #[regex("--[^\n]*", logos::skip)]  // Single-line comment
+    #[token("def")]
+    Def,
+    #[token("end")]
+    End,
+    #[token("if")]
+    If,
+    #[token("else")]
+    Else,
+    
+    #[regex("--[^\n]*", logos::skip)]
     Comment,
-
-    #[regex("---[ \t]*\n(?s).*?\n---", logos::skip)]  // Multi-line comment
+    #[regex("---", parse_multiline_comment)]
     MultiComment,
-
+    
     #[token("[")]
     LBracket,
-
     #[token("]")]
     RBracket,
-
     #[token("(")]
     LParen,
-
     #[token(")")]
     RParen,
-
-    #[token("{")]
-    LBrace,
-
-    #[token("}")]
-    RBrace,
-
-    #[token(";")]
-    Semi,
-
+    #[token("=")]
+    Assign,
+    #[token(",")]
+    Comma,
+    
     #[regex("[a-zA-Z_][a-zA-Z0-9_]*")]
     Ident,
-
-    #[regex(r#"[0-9]+"#)]
-    Number,
-
-    #[regex(r#"/[^/]+/[a-z]*/?"#)]  // Simplified path for require
-    Path,
-
-    #[error]
-    #[regex(r"[ \t\n\f]+", logos::skip)]
-    Error,
+    #[regex("[0-9]+")]
+    Integer,
 }
 
-// AST Node representation using indextree
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum AstNode {
-    Program(Vec<NodeId>),  // Root with statements
-    Statement(StatementKind),
-    Expression(ExpressionKind),
+fn parse_multiline_comment(lex: &mut Lexer<Token>) -> logos::Skip {
+    let remainder = lex.remainder();
+    if let Some(end_idx) = remainder.find("---") {
+        lex.bump(end_idx + 3);
+        logos::Skip
+    } else {
+        lex.bump(remainder.len());
+        logos::Skip
+    }
 }
 
+// --- AST Definitions ---
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum StatementKind {
-    Write(NodeId),  // write expression;
-    Require(String), // require [path];
+enum AstNode<T> {
+    Program(Vec<T>),
+    Statement(StatementKind<T>),
+    Expression(ExpressionKind<T>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ExpressionKind {
+enum StatementKind<T> {
+    Require(String),
+    Write(T),
+    Assignment { name: String, value: T },
+    FunctionDef { name: String, args: Vec<String>, body: Vec<T> },
+    If { condition: T, then_block: Vec<T>, else_block: Option<Vec<T>> },
+    ExprStmt(T),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ExpressionKind<T> {
     Literal(String),
-    Ident(String),
-    // Add more as needed
+    Integer(i64),
+    Variable(String),
+    Call { name: String, args: Vec<T> },
+    #[serde(skip)]
+    _Marker(PhantomData<T>),
 }
 
-// Output to compiler (JSON)
+impl<T> ExpressionKind<T> {
+    fn literal(s: String) -> Self { ExpressionKind::Literal(s) }
+    fn integer(i: i64) -> Self { ExpressionKind::Integer(i) }
+    fn variable(s: String) -> Self { ExpressionKind::Variable(s) }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct FrontendOutput {
     source: String,
-    ast_arena: Vec<AstNode>, // Serialized nodes
-    root_id: usize,
+    ast_nodes: Vec<AstNode<usize>>,
+    root_index: usize,
 }
 
-// Serialize arena to vec (simplified: assumes nodes are in order)
-fn serialize_arena(arena: &Arena<AstNode>) -> (Vec<AstNode>, NodeId) {
-    let root = arena.iter().next().unwrap().0; // Assume first is root
-    let nodes: Vec<_> = arena.iter().map(|(_, node)| node.data.clone()).collect();
-    (nodes, root)
-}
+// --- Parser ---
 
-// Parser using winnow
-fn parse_program(input: &mut &str) -> PResult<Vec<AstNode>> {
-    terminated(many0(parse_statement), eof).parse_next(input)
-}
-
-fn parse_statement(input: &mut &str) -> PResult<AstNode> {
-    alt((
-        parse_write.map(AstNode::Statement),
-        parse_require.map(AstNode::Statement),
-    )).parse_next(input)
-}
-
-fn parse_write(input: &mut &str) -> PResult<StatementKind> {
-    let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
-    let _ = literal("write").parse_next(input)?;
-    let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
-    let expr = parse_expression.parse_next(input)?;
-    let _ = literal(";").parse_next(input)?;
-    Ok(StatementKind::Write(expr)) // Note: this would need to be NodeId, but simplified
-    // In full, we'd build the arena here
-}
-
-fn parse_require(input: &mut &str) -> PResult<StatementKind> {
-    let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
-    let _ = literal("require").parse_next(input)?;
-    let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
-    let path = delimited(literal("["), take_while(1.., |c| c != ']'), literal("]")).parse_next(input)?;
-    let _ = literal(";").parse_next(input)?;
-    Ok(StatementKind::Require(path.to_string()))
-}
-
-fn parse_expression(input: &mut &str) -> PResult<NodeId> {
-    // Placeholder: parse literal or ident
-    // For now, assume literal as [content]
-    let content = delimited(literal("["), take_while(0.., |c| c != ']'), literal("]")).parse_next(input)?;
-    // In full: create node in arena
-    // Here, simplified
-    Err(winnow::error::ErrMode::Cut(winnow::error::ContextError::new())) // Placeholder
-}
-
-// Actually, we need to build the arena during parsing
-struct Parser<'a> {
+struct NulaParser<'a> {
+    arena: Arena<AstNode<NodeId>>,
     source: &'a str,
-    arena: Arena<AstNode>,
 }
 
-impl<'a> Parser<'a> {
+impl<'a> NulaParser<'a> {
     fn new(source: &'a str) -> Self {
         Self {
-            source,
             arena: Arena::new(),
+            source,
         }
     }
 
-    fn parse(&mut self) -> Result<NodeId> {
+    fn parse(&mut self) -> Result<NodeId, FrontendError> {
         let mut input = self.source;
-        let statements = many0(|i: &mut _| self.parse_statement(i)).parse(&mut input).map_err(|e| {
-            FrontendError::Parse {
-                message: e.to_string(),
+        let statements = self.parse_block(&mut input)?;
+
+        // Ensure we consumed everything (except trailing whitespace)
+        let _: Result<&str, ErrMode<ContextError>> = take_while(0.., |c: char| c.is_whitespace()).parse_next(&mut input);
+
+        if !input.is_empty() {
+             return Err(FrontendError::Parse {
+                message: format!("Unexpected input remaining: {:.20}...", input),
                 src: NamedSource::new("input.nula", self.source.to_string()),
-                span: SourceSpan::new(0.into(), 0.into()), // Placeholder span
-            }
-        })?;
+                span: SourceSpan::new(0usize.into(), 0usize.into()),
+            });
+        }
+
         let root = self.arena.new_node(AstNode::Program(statements));
         Ok(root)
     }
 
-    fn parse_statement(&mut self, input: &mut &'a str) -> PResult<NodeId> {
-        alt((
-            self.parse_write,
-            self.parse_require,
-        )).parse_next(input)
+    fn parse_block(&mut self, input: &mut &'a str) -> Result<Vec<NodeId>, FrontendError> {
+        let mut statements = Vec::new();
+        loop {
+            // Consume whitespace
+            let _: Result<&str, ErrMode<ContextError>> = take_while(0.., |c: char| c.is_whitespace()).parse_next(input);
+
+            if input.is_empty() {
+                break;
+            }
+            
+            // Check terminators for blocks using peek with explicit types
+            if peek::<_, _, ContextError, _>("end").parse_next(input).is_ok() {
+                break;
+            }
+            if peek::<_, _, ContextError, _>("else").parse_next(input).is_ok() {
+                break;
+            }
+
+            match self.parse_statement(input) {
+                Ok(stmt) => statements.push(stmt),
+                Err(_) => {
+                     return Err(FrontendError::Parse {
+                        message: "Expected statement".to_string(),
+                        src: NamedSource::new("input.nula", self.source.to_string()),
+                        span: SourceSpan::new(0usize.into(), 0usize.into()),
+                    });
+                }
+            }
+        }
+        Ok(statements)
     }
 
-    fn parse_write(&mut self, input: &mut &'a str) -> PResult<NodeId> {
-        let start = input.as_ptr() as usize - self.source.as_ptr() as usize;
-        let _ = take_while(0.., char::is_whitespace).parse_next(input)?;
-        let _ = "write".parse_next(input)?;
-        let _ = take_while(1.., char::is_whitespace).parse_next(input)?;
-        let expr_id = self.parse_expression(input)?;
-        let _ = ";".parse_next(input)?;
-        let end = input.as_ptr() as usize - self.source.as_ptr() as usize;
-        let stmt = self.arena.new_node(AstNode::Statement(StatementKind::Write(expr_id)));
-        Ok(stmt)
+    fn parse_statement(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        // Dispatch based on keyword or identifier
+        if peek::<_, _, ContextError, _>("write").parse_next(input).is_ok() {
+            self.parse_write(input)
+        } else if peek::<_, _, ContextError, _>("require").parse_next(input).is_ok() {
+            self.parse_require(input)
+        } else if peek::<_, _, ContextError, _>("def").parse_next(input).is_ok() {
+            self.parse_def(input)
+        } else if peek::<_, _, ContextError, _>("if").parse_next(input).is_ok() {
+            self.parse_if(input)
+        } else {
+            // Assignment (Ident =) or Expression
+            // Lookahead for assignment
+            let checkpoint = *input;
+            if self.parse_assignment_lookahead(input) {
+                *input = checkpoint; // Backtrack to parse properly
+                self.parse_assignment(input)
+            } else {
+                *input = checkpoint;
+                // Fallback to expression statement
+                let expr = self.parse_expression(input)?;
+                Ok(self.arena.new_node(AstNode::Statement(StatementKind::ExprStmt(expr))))
+            }
+        }
     }
 
-    fn parse_require(&mut self, input: &mut &'a str) -> PResult<NodeId> {
-        let _ = take_while(0.., char::is_whitespace).parse_next(input)?;
+    fn parse_assignment_lookahead(&self, mut input: &str) -> bool {
+        // Check if pattern is Ident = ...
+        // We use a tuple parser with explicit types to ensure proper inference
+        let check: ModalResult<_, ContextError> = (
+            take_while(0.., |c: char| c.is_whitespace()),
+            take_while(1.., |c: char| c.is_alphanumeric() || c == '_'),
+            take_while(0.., |c: char| c.is_whitespace()),
+            "=",
+        ).parse_next(&mut input);
+        
+        check.is_ok()
+    }
+
+    fn parse_assignment(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        let name = self.parse_ident(input)?;
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let _ = "=".parse_next(input)?;
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let value = self.parse_expression(input)?;
+        
+        Ok(self.arena.new_node(AstNode::Statement(StatementKind::Assignment { name: name.to_string(), value })))
+    }
+
+    fn parse_require(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
         let _ = "require".parse_next(input)?;
-        let _ = take_while(1.., char::is_whitespace).parse_next(input)?;
-        let path = delimited("[", take_while(1.., |c| c != ']'), "]").parse_next(input)?.to_string();
-        let _ = ";".parse_next(input)?;
-        let stmt = self.arena.new_node(AstNode::Statement(StatementKind::Require(path)));
-        Ok(stmt)
+        let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let path_content = self.parse_string_bracket(input)?;
+        Ok(self.arena.new_node(AstNode::Statement(StatementKind::Require(path_content))))
     }
 
-    fn parse_expression(&mut self, input: &mut &'a str) -> PResult<NodeId> {
-        // Simple literal [content]
-        let content = delimited("[", take_while(0.., |c| c != ']'), "]").parse_next(input)?.to_string();
-        let expr = self.arena.new_node(AstNode::Expression(ExpressionKind::Literal(content)));
-        Ok(expr)
+    fn parse_write(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        let _ = "write".parse_next(input)?;
+        let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let expr = self.parse_expression(input)?;
+        Ok(self.arena.new_node(AstNode::Statement(StatementKind::Write(expr))))
+    }
+
+    fn parse_def(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        let _ = "def".parse_next(input)?;
+        let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let name = self.parse_ident(input)?.to_string();
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        
+        let mut args = Vec::new();
+        // Use opt to check for existence of opening parenthesis
+        if opt::<_, _, ContextError, _>("(").parse_next(input)?.is_some() {
+            // Parse args
+            loop {
+                 let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+                 if peek::<_, _, ContextError, _>(")").parse_next(input).is_ok() {
+                     break;
+                 }
+                 let arg = self.parse_ident(input)?;
+                 args.push(arg.to_string());
+                 let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+                 // Optional comma
+                 if opt::<_, _, ContextError, _>(",").parse_next(input)?.is_none() {
+                     break;
+                 }
+            }
+            let _ = ")".parse_next(input)?;
+        }
+
+        // Body
+        let body_nodes = self.parse_block(input).map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
+        
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let _ = "end".parse_next(input)?;
+
+        Ok(self.arena.new_node(AstNode::Statement(StatementKind::FunctionDef { name, args, body: body_nodes })))
+    }
+
+    fn parse_if(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        let _ = "if".parse_next(input)?;
+        let _ = take_while(1.., |c: char| c.is_whitespace()).parse_next(input)?;
+        let condition = self.parse_expression(input)?;
+        
+        let then_block = self.parse_block(input).map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
+        
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        
+        let mut else_block = None;
+        if opt::<_, _, ContextError, _>("else").parse_next(input)?.is_some() {
+            let block = self.parse_block(input).map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
+            else_block = Some(block);
+            let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+        }
+        
+        let _ = "end".parse_next(input)?;
+
+        Ok(self.arena.new_node(AstNode::Statement(StatementKind::If { condition, then_block, else_block })))
+    }
+
+    fn parse_expression(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        self.parse_atom(input)
+    }
+
+    fn parse_atom(&mut self, input: &mut &'a str) -> ModalResult<NodeId> {
+        let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+
+        if peek::<_, _, ContextError, _>("[").parse_next(input).is_ok() {
+            let s = self.parse_string_bracket(input)?;
+            Ok(self.arena.new_node(AstNode::Expression(ExpressionKind::literal(s))))
+        } else if peek::<_, _, ContextError, _>(one_of::<_, _, ContextError>(|c: char| c.is_ascii_digit())).parse_next(input).is_ok() {
+             let num_str: &str = take_while(1.., |c: char| c.is_ascii_digit()).parse_next(input)?;
+             let num: i64 = num_str.parse().unwrap_or(0);
+             Ok(self.arena.new_node(AstNode::Expression(ExpressionKind::integer(num))))
+        } else {
+            // Ident or Call
+            let ident = self.parse_ident(input)?;
+            let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+            if peek::<_, _, ContextError, _>("(").parse_next(input).is_ok() {
+                // Call
+                let _ = "(".parse_next(input)?;
+                let mut args = Vec::new();
+                 loop {
+                     let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+                     if peek::<_, _, ContextError, _>(")").parse_next(input).is_ok() {
+                         break;
+                     }
+                     let arg = self.parse_expression(input)?;
+                     args.push(arg);
+                     let _ = take_while(0.., |c: char| c.is_whitespace()).parse_next(input)?;
+                     if opt::<_, _, ContextError, _>(",").parse_next(input)?.is_none() {
+                         break;
+                     }
+                }
+                let _ = ")".parse_next(input)?;
+                Ok(self.arena.new_node(AstNode::Expression(ExpressionKind::Call { name: ident.to_string(), args })))
+            } else {
+                // Var
+                Ok(self.arena.new_node(AstNode::Expression(ExpressionKind::variable(ident.to_string()))))
+            }
+        }
+    }
+
+    fn parse_ident(&mut self, input: &mut &'a str) -> ModalResult<&'a str> {
+        take_while(1.., |c: char| c.is_alphanumeric() || c == '_').parse_next(input)
+    }
+
+    fn parse_string_bracket(&mut self, input: &mut &'a str) -> ModalResult<String> {
+        let _ = "[".parse_next(input)?;
+        let content: Vec<String> = repeat(0.., alt((
+            take_while(1.., |c| c != '[' && c != ']').map(String::from),
+            |i: &mut &'a str| {
+                 let nested = self.parse_string_bracket(i)?;
+                 Ok(format!("[{}]", nested))
+            }
+        ))).parse_next(input)?;
+        let _ = "]".parse_next(input)?;
+        Ok(content.join(""))
     }
 }
 
-// CLI
-#[derive(Parser, Debug)]
+#[derive(ClapParser, Debug)]
 #[command(version, about = "Nula Frontend (Lexer & Parser)")]
 struct Cli {
-    /// Input source file
     #[arg(short, long)]
     input: PathBuf,
-
-    /// Output JSON file
     #[arg(short, long)]
     output: PathBuf,
 }
 
-fn lex_source(source: &str) -> Result<Vec<Token>> {
-    let mut lexer = Token::lexer(source);
-    let mut tokens = Vec::new();
-    while let Some(token) = lexer.next() {
-        if token == Token::Error {
-            return Err(FrontendError::Lex {
-                message: "Invalid token".to_string(),
-                src: NamedSource::new("input.nula", source.to_string()),
-                span: SourceSpan::new(lexer.span().start.into(), (lexer.span().end - lexer.span().start).into()),
-            }.into());
-        }
-        tokens.push(token);
-    }
-    Ok(tokens)
-}
-
 fn main() -> Result<()> {
     env_logger::init();
-
     let cli = Cli::parse();
 
-    // Read input source
     let mut input_file = File::open(&cli.input).context("Failed to open input file")?;
     let mut source = String::new();
     input_file.read_to_string(&mut source)?;
 
-    // Lex (though parser uses string directly, but for validation)
-    let _tokens = lex_source(&source)?; // Can integrate Logos with winnow if needed
+    // Basic Lexer Check (Logos)
+    let mut lexer = Token::lexer(&source);
+    while let Some(token) = lexer.next() {
+        if let Err(_) = token { /* Handle lex error */ }
+    }
 
-    // Parse
-    let mut parser = Parser::new(&source);
-    let root = parser.parse()?;
+    // Parser (Winnow)
+    let mut parser = NulaParser::new(&source);
+    let root_id = parser.parse()?;
 
-    // Serialize
-    let (ast_arena, _) = serialize_arena(&parser.arena); // Note: root_id is root.index()
+    // Flatten Arena
+    let mut flat_nodes: Vec<AstNode<usize>> = Vec::new();
+    let mut id_map: HashMap<NodeId, usize> = HashMap::new();
+
+    let mut node_ids = Vec::new();
+    
+    // Use descendants to gather all reachable nodes from root
+    for id in root_id.descendants(&parser.arena) {
+        if !id_map.contains_key(&id) {
+            id_map.insert(id, flat_nodes.len());
+            flat_nodes.push(AstNode::Program(vec![])); // Placeholder
+            node_ids.push(id);
+        }
+    }
+    if !id_map.contains_key(&root_id) {
+        id_map.insert(root_id, flat_nodes.len());
+        flat_nodes.push(AstNode::Program(vec![]));
+        node_ids.push(root_id);
+    }
+
+    // Helper closure to map ID to usize
+    let mapper = |id: &NodeId| *id_map.get(id).unwrap_or(&0);
+    let map_vec = |v: &Vec<NodeId>| v.iter().map(mapper).collect();
+
+    for (i, &old_id) in node_ids.iter().enumerate() {
+        let node = parser.arena.get(old_id).unwrap().get();
+        let new_node = match node {
+            AstNode::Program(stmts) => AstNode::Program(map_vec(stmts)),
+            AstNode::Statement(kind) => match kind {
+                StatementKind::Write(expr_id) => AstNode::Statement(StatementKind::Write(mapper(expr_id))),
+                StatementKind::Require(s) => AstNode::Statement(StatementKind::Require(s.clone())),
+                StatementKind::Assignment { name, value } => AstNode::Statement(StatementKind::Assignment { name: name.clone(), value: mapper(value) }),
+                StatementKind::ExprStmt(val) => AstNode::Statement(StatementKind::ExprStmt(mapper(val))),
+                StatementKind::FunctionDef { name, args, body } => AstNode::Statement(StatementKind::FunctionDef { name: name.clone(), args: args.clone(), body: map_vec(body) }),
+                StatementKind::If { condition, then_block, else_block } => AstNode::Statement(StatementKind::If { 
+                    condition: mapper(condition), 
+                    then_block: map_vec(then_block), 
+                    else_block: else_block.as_ref().map(map_vec) 
+                }),
+            },
+            AstNode::Expression(kind) => match kind {
+                ExpressionKind::Literal(s) => AstNode::Expression(ExpressionKind::Literal(s.clone())),
+                ExpressionKind::Integer(i) => AstNode::Expression(ExpressionKind::Integer(*i)),
+                ExpressionKind::Variable(s) => AstNode::Expression(ExpressionKind::Variable(s.clone())),
+                ExpressionKind::Call { name, args } => AstNode::Expression(ExpressionKind::Call { name: name.clone(), args: map_vec(args) }),
+                ExpressionKind::_Marker(_) => AstNode::Expression(ExpressionKind::_Marker(PhantomData)),
+            },
+        };
+        flat_nodes[i] = new_node;
+    }
+
     let output = FrontendOutput {
         source,
-        ast_arena,
-        root_id: root.index(),
+        ast_nodes: flat_nodes,
+        root_index: *id_map.get(&root_id).unwrap_or(&0),
     };
+    
     let json = serde_json::to_string(&output)?;
-
-    // Write output JSON
     fs::write(&cli.output, json).context("Failed to write output JSON")?;
 
-    info!("Frontend processing successful!");
     Ok(())
 }
