@@ -5,7 +5,7 @@ edition = "2021"
 description = "The backend compiler for the Nula programming language, handling semantic analysis, type checking, and code generation."
 authors = ["Michal92299 <michalkaczmarzyk2009@gmail.com>"]
 license = "MIT"
-repository = "https://github.com/yourusername/nula-compiler"
+repository = "https://github.com/michal92299/nula-programing-language/tree/main/compiler"
 readme = "README.md"
 
 [dependencies]
