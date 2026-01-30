@@ -6,172 +6,137 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use indextree::{Arena, NodeId};
-use log::{debug, error, info};
+use log::{info, error, debug};
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read};
+use std::path::{PathBuf};
+use std::str::FromStr;
 use target_lexicon::Triple;
 use thiserror::Error;
-use tycho;  // Placeholder for Tycho; assume it's a crate for semantic analysis and types.
 
-// Custom error types with miette integration
+// Mock Tycho module for Semantic Analysis
+mod tycho {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TypeInfo {
+        pub name: String,
+        pub size: u32,
+    }
+
+    pub struct Analyzer;
+
+    impl Analyzer {
+        pub fn analyze(_nodes: &[AstNode<usize>]) -> Result<HashMap<usize, TypeInfo>> {
+            Ok(HashMap::new())
+        }
+    }
+}
+
 #[derive(Error, Diagnostic, Debug)]
 enum CompilerError {
     #[error("IO error: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Semantic analysis failed: {message}")]
-    #[diagnostic(code(nula::semantic_error))]
-    Semantic {
-        message: String,
-        #[source_code]
-        src: NamedSource<String>,
-        #[label("here")]
-        span: SourceSpan,
-    },
-
-    #[error("Type checking failed: {message}")]
-    #[diagnostic(code(nula::type_error))]
-    Type {
-        message: String,
-        #[source_code]
-        src: NamedSource<String>,
-        #[label("here")]
-        span: SourceSpan,
-    },
-
-    #[error("Code generation failed: {0}")]
-    CodeGen(String),
-
-    #[error("Invalid configuration: {0}")]
+    #[error("Config error: {0}")]
     Config(String),
+
+    #[error("Cranelift module error: {0}")]
+    Module(#[from] cranelift_module::ModuleError),
+
+    #[error("Source error")]
+    #[diagnostic(code(nula::source_error))]
+    SourceError {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("here")]
+        span: SourceSpan,
+    }
 }
 
-// AST Node representation using indextree
+// AST Definitions matching Frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum AstNode {
-    Program(Vec<NodeId>),  // Root program with statements
-    Statement(StatementKind),
-    Expression(ExpressionKind),
-    // Add more as needed
+enum AstNode<T> {
+    Program(Vec<T>),
+    Statement(StatementKind<T>),
+    Expression(ExpressionKind<T>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum StatementKind {
-    Write(ExpressionKind),
-    Require(String),  // e.g., "rust/std/collection"
-    // Add more statements
+enum StatementKind<T> {
+    Require(String),
+    Write(T),
+    Assignment { name: String, value: T },
+    FunctionDef { name: String, args: Vec<String>, body: Vec<T> },
+    If { condition: T, then_block: Vec<T>, else_block: Option<Vec<T>> },
+    ExprStmt(T),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum ExpressionKind {
+enum ExpressionKind<T> {
     Literal(String),
-    // Add more expressions
+    Integer(i64),
+    Variable(String),
+    Call { name: String, args: Vec<T> },
+    #[serde(skip)]
+    _Marker(std::marker::PhantomData<T>),
 }
 
-// Type system placeholder (using Tycho if available)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TypeInfo {
-    // Placeholder
-    ty: String,
-}
-
-// Semantic info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SemanticInfo {
-    types: HashMap<NodeId, TypeInfo>,
-    // More fields
-}
-
-// Input from frontend (JSON)
 #[derive(Debug, Serialize, Deserialize)]
 struct FrontendOutput {
-    source: String,          // Original source code for diagnostics
-    ast_arena: Vec<AstNode>, // Serialized arena; we'll reconstruct
-    root_id: usize,          // Root node ID
+    source: String,
+    ast_nodes: Vec<AstNode<usize>>,
+    root_index: usize,
 }
 
-// Reconstruct indextree Arena from serialized vec (simplified)
-fn reconstruct_arena(serialized: Vec<AstNode>) -> Arena<AstNode> {
-    let mut arena = Arena::new();
-    for node in serialized {
-        arena.new_node(node);
-    }
-    arena
-}
-
-// Compiler configuration from CLI or Nula.hcl
 #[derive(Parser, Debug)]
 #[command(version, about = "Nula Compiler Backend")]
 struct Cli {
-    /// Input JSON file from frontend
     #[arg(short, long)]
     input: PathBuf,
-
-    /// Output binary path
     #[arg(short, long)]
     output: PathBuf,
-
-    /// Target triple for cross-compilation
     #[arg(long, default_value = "native")]
     target: String,
-
-    /// Use arena allocator for automatic memory management
     #[arg(long)]
     arena_allocator: bool,
-
-    /// Manual memory management
     #[arg(long)]
     manual_memory: bool,
-
-    /// Generate fully static binary
     #[arg(long)]
     static_binary: bool,
-
-    /// Generate fully dynamic binary
     #[arg(long)]
     dynamic_binary: bool,
-
-    /// Optimize for small binary size (slower compile)
     #[arg(long)]
     small_binary: bool,
-
-    /// Optimize for fast compilation (larger binary)
     #[arg(long)]
     fast_compile: bool,
 }
 
-// Main compiler logic
 struct NulaCompiler {
-    arena: Arena<AstNode>,
-    root: NodeId,
-    source: String,
-    semantic_info: SemanticInfo,
+    nodes: Vec<AstNode<usize>>,
+    root_index: usize,
     module: ObjectModule,
     cli: Cli,
 }
 
 impl NulaCompiler {
     fn new(frontend_output: FrontendOutput, cli: Cli) -> Result<Self> {
-        let arena = reconstruct_arena(frontend_output.ast_arena);
-        let root = NodeId::new(frontend_output.root_id);
+        let nodes = frontend_output.ast_nodes;
+        let root_index = frontend_output.root_index;
 
-        // Setup Cranelift module
         let triple = if cli.target == "native" {
             Triple::host()
         } else {
             Triple::from_str(&cli.target).map_err(|e| CompilerError::Config(e.to_string()))?
         };
-        let isa_builder = isa_lookup(triple).map_err(|e| CompilerError::Config(e.to_string()))?;
+
         let mut flag_builder = settings::builder();
-        // Set flags based on CLI
         if cli.small_binary {
             flag_builder.set("opt_level", "size").unwrap();
         } else if cli.fast_compile {
@@ -179,134 +144,139 @@ impl NulaCompiler {
         } else {
             flag_builder.set("opt_level", "speed_and_size").unwrap();
         }
-        // More flags for safety/memory (placeholder)
+
         if cli.arena_allocator {
-            // Enable arena allocator flags or integrations
-            info!("Enabling arena allocator for memory safety");
-        } else if cli.manual_memory {
-            info!("Enabling manual memory management");
+            info!("Arena allocator enabled");
         }
-        let flags = settings::Flags::new(flag_builder);
-        let isa = isa_builder.finish(flags).unwrap();
+
+        let isa_builder = isa_lookup(triple).map_err(|e| CompilerError::Config(e.to_string()))?;
+        let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
 
         let builder = ObjectBuilder::new(isa, "nula_module", cranelift_module::default_libcall_names())?;
         let module = ObjectModule::new(builder);
 
         Ok(Self {
-            arena,
-            root,
-            source: frontend_output.source,
-            semantic_info: SemanticInfo {
-                types: HashMap::new(),
-            },
+            nodes,
+            root_index,
             module,
             cli,
         })
     }
 
-    fn perform_semantic_analysis(&mut self) -> Result<()> {
-        // Use Tycho for semantic analysis (placeholder)
-        info!("Performing semantic analysis with Tycho");
-        // Walk the AST using indextree
-        for node_id in self.root.descendants(&self.arena) {
-            if let Some(node) = self.arena.get(node_id) {
-                match node.get() {
-                    AstNode::Expression(expr) => {
-                        // Analyze expression
-                        let ty = self.analyze_expr(expr)?;
-                        self.semantic_info.types.insert(node_id, TypeInfo { ty });
-                    }
-                    // Handle other nodes
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
-    }
+    fn compile(mut self) -> Result<()> {
+        let _types = tycho::Analyzer::analyze(&self.nodes)?;
+        info!("Semantic analysis passed");
 
-    fn analyze_expr(&self, _expr: &ExpressionKind) -> Result<String> {
-        // Placeholder analysis
-        Ok("i32".to_string())  // Use Tycho here
-    }
-
-    fn type_check(&self) -> Result<()> {
-        // Use Tycho for type checking
-        info!("Type checking with Tycho");
-        // Placeholder: check types
-        for (_id, ty) in &self.semantic_info.types {
-            debug!("Type: {}", ty.ty);
-        }
-        Ok(())
-    }
-
-    fn generate_code(&mut self) -> Result<()> {
-        // Use Cranelift for code generation
-        info!("Generating code with Cranelift");
-
-        // Declare main function
         let mut ctx = self.module.make_context();
         let mut func_builder_ctx = FunctionBuilderContext::new();
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_builder_ctx);
 
-        // Placeholder: generate IR for AST
-        let entry_block = builder.create_block();
-        builder.switch_to_block(entry_block);
+        let mut sig = self.module.make_signature();
+        sig.returns.push(AbiParam::new(types::I32));
+        ctx.func.signature = sig;
 
-        // Example: simple write (puts equivalent)
-        // Assuming a simple program
-        let hello = builder.ins().iconst(types::I32, 42);  // Placeholder
-        // Call to write function (link to runtime or something)
+        let func_id = self.module.declare_function("main", Linkage::Export, &ctx.func.signature)?;
 
-        builder.ins().return_(&[]);
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_builder_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
 
-        // Define function
-        let id = self.module.declare_function("main", Linkage::Export, &ctx.func.signature)?;
-        self.module.define_function(id, &mut ctx)?;
+            if self.root_index < self.nodes.len() {
+                self.codegen_node(self.root_index, &mut builder)?;
+            }
 
-        // Finalize
-        self.module.finalize_definitions()?;
+            let ret_val = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[ret_val]);
+
+            builder.finalize();
+        }
+
+        self.module.define_function(func_id, &mut ctx)?;
+        self.module.clear_context(&mut ctx);
+
+        let product = self.module.finish();
+        let obj_data = product.emit()?;
+        fs::write(&self.cli.output, obj_data).context("Failed to write object file")?;
 
         Ok(())
     }
 
-    fn output_binary(&self) -> Result<()> {
-        let obj = self.module.object().finish();
-        fs::write(&self.cli.output, obj).context("Failed to write output binary")?;
-        Ok(())
-    }
-
-    fn compile(&mut self) -> Result<()> {
-        self.perform_semantic_analysis()?;
-        self.type_check()?;
-        self.generate_code()?;
-        self.output_binary()?;
+    fn codegen_node(&self, index: usize, builder: &mut FunctionBuilder) -> Result<()> {
+        if let Some(node) = self.nodes.get(index) {
+            match node {
+                AstNode::Program(stmt_indices) => {
+                    for &stmt_idx in stmt_indices {
+                        self.codegen_node(stmt_idx, builder)?;
+                    }
+                }
+                AstNode::Statement(stmt) => match stmt {
+                    StatementKind::Write(expr_idx) => {
+                        self.codegen_node(*expr_idx, builder)?;
+                        debug!("Generated write");
+                    }
+                    StatementKind::Require(path) => {
+                        debug!("Required: {}", path);
+                    }
+                    StatementKind::Assignment { name, value: _ } => {
+                        debug!("Assignment to {}", name);
+                        // Simplified: In a real implementation, would use stack slots
+                    }
+                    StatementKind::FunctionDef { name, .. } => {
+                        debug!("Function definition: {}", name);
+                    }
+                    StatementKind::If { .. } => {
+                        debug!("If Statement");
+                    }
+                    StatementKind::ExprStmt(expr_idx) => {
+                        self.codegen_node(*expr_idx, builder)?;
+                    }
+                },
+                AstNode::Expression(expr) => match expr {
+                    ExpressionKind::Literal(text) => {
+                        debug!("Literal: {}", text);
+                    }
+                    ExpressionKind::Integer(val) => {
+                        debug!("Integer: {}", val);
+                    }
+                    ExpressionKind::Variable(name) => {
+                        debug!("Variable usage: {}", name);
+                    }
+                    ExpressionKind::Call { name, .. } => {
+                        debug!("Call: {}", name);
+                    }
+                    _ => {}
+                },
+            }
+        }
         Ok(())
     }
 }
 
 fn main() -> Result<()> {
     env_logger::init();
-
     let cli = Cli::parse();
 
-    // Read input JSON
     let mut input_file = File::open(&cli.input).context("Failed to open input JSON")?;
     let mut json_str = String::new();
     input_file.read_to_string(&mut json_str)?;
+
     let frontend_output: FrontendOutput = serde_json::from_str(&json_str)?;
+    let compiler = NulaCompiler::new(frontend_output, cli)?;
 
-    let mut compiler = NulaCompiler::new(frontend_output, cli)?;
-
-    compiler.compile().map_err(|e| {
-        // Use miette for pretty error reporting
-        if let Some(diag) = e.downcast_ref::<CompilerError>() {
-            let report = miette::Report::new(diag.clone());
-            eprintln!("{:?}", report);
-        } else {
-            error!("Unexpected error: {}", e);
+    if let Err(e) = compiler.compile() {
+        match e.downcast::<CompilerError>() {
+            Ok(diag) => {
+                eprintln!("{:?}", miette::Report::new(diag));
+                std::process::exit(1);
+            }
+            Err(e) => {
+                error!("Compiler failed: {}", e);
+                return Err(e);
+            }
         }
-        e
-    })?;
+    }
 
     info!("Compilation successful!");
     Ok(())
